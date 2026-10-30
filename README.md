@@ -203,13 +203,21 @@ For browser-side audio problems, capture the Network tab or a HAR file and inspe
 
 ## Tests and Verification
 
-Run all tests:
+Run type checks, lint, and all tests:
 
 ```powershell
+npm.cmd run check
+```
+
+Or run them separately:
+
+```powershell
+npm.cmd run typecheck
+npm.cmd run lint
 npm.cmd test
 ```
 
-Run the full production build, including TypeScript checks:
+Run the full production build:
 
 ```powershell
 npm.cmd run build

@@ -9,7 +9,11 @@
     "dev:client": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build && npm run build:server",
     "build:server": "tsc -p tsconfig.server.json && node scripts/write-server-package.cjs",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
     "test": "vitest run",
+    "check": "npm run typecheck && npm run lint && npm test",
     "probe:trailers": "tsx scripts/probe-yandex-trailers.ts",
     "start": "node dist-server/index.js"
   },
@@ -25,13 +29,18 @@
     "socket.io-client": "^4.8.1"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
     "@types/node": "^22.10.5",
     "@types/react": "^19.0.4",
     "@types/react-dom": "^19.0.2",
+    "eslint": "^10.13.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.13.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
+    "typescript-eslint": "^8.72.1",
     "vite": "^6.0.7",
     "vitest": "^2.1.8"
   }
