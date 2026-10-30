@@ -8,14 +8,14 @@ Real-time multiplayer music guessing game. The Express/Socket.IO server is autho
 
 ## Setup
 
-Requirements: Node.js 20+ and npm.
+Requirements: Node.js 24+ and npm.
 
 ```powershell
 npm ci
 Copy-Item .env.example .env
 ```
 
-`.env` is optional for basic work, but the server reads it for ports, CORS, Yandex Music, audio delivery, and optional Upstash persistence. Never commit `.env` or tokens.
+`.env` is optional for basic work, but the server reads it for ports, CORS, Yandex Music, audio delivery, and the local SQLite database. The scripts use Node's built-in `--env-file-if-exists=.env`. Never commit `.env`, the `data/` directory, or tokens.
 
 ## Commands
 
@@ -31,6 +31,8 @@ npm run check        # typecheck + lint + tests
 npm run build        # typecheck + client build + server build
 npm start            # run compiled server from dist-server
 npm run probe:trailers
+docker compose up --build
+docker compose down
 ```
 
 Windows PowerShell may require `npm.cmd` instead of `npm` if script execution is restricted.
@@ -49,6 +51,17 @@ npm run build
 ```
 
 `npm run lint` currently has a small number of pre-existing warnings (hook dependency arrays and unused symbols). The lint command must finish with zero errors; do not add new warnings. Do not edit `dist/`, `dist-server/`, or `node_modules/`.
+
+For storage or container changes, also run:
+
+```powershell
+docker compose build
+docker compose up -d
+# check http://127.0.0.1:3001/api/health
+docker compose down
+```
+
+Use `docker compose down -v` only when you intend to delete the local room database.
 
 ## Repository Structure
 
@@ -72,7 +85,7 @@ server/
   music.ts                 Yandex Music sources, themes, search, probing
   audioDelivery.ts         direct vs cache audio delivery selection
   audioCache.ts            in-memory audio cache and range responses
-  roomStore.ts             optional Upstash Redis room persistence
+  roomStore.ts             local SQLite room persistence
   roundPlanning.ts         track-pool limits and synchronized round start
   *.test.ts                colocated Vitest unit tests
 
@@ -81,11 +94,12 @@ scripts/
   write-server-package.cjs marks dist-server as CommonJS
 
 public/                    favicon and local fonts
+Dockerfile                 multi-stage production image
+compose.yaml               single-container app with a data volume
 vite.config.ts             Vite dev server and API/WebSocket proxy
 tsconfig.json              client/server/scripts typecheck (no emit)
 tsconfig.server.json       CommonJS server build into dist-server
 eslint.config.js           ESLint flat config
-render.yaml                Render deployment config
 ```
 
 ## Architecture Notes
@@ -97,7 +111,7 @@ render.yaml                Render deployment config
 - UI routes: `/room/<CODE>` (normal), `/room/<CODE>/display` (TV), `/room/<CODE>/player` (phone).
 - REST endpoints: `/api/health`, `/api/themes`, `/api/music/playlists/search`, `/api/music/diagnostics`, `/api/music/probe`, `/api/audio/:id`.
 - Audio can be delivered directly from Yandex URLs or through the server cache. Changing delivery affects warmup timing and playback behavior.
-- Without Upstash credentials, rooms live only in memory. Persisted rooms restore after restart, but unfinished matches return to the lobby.
+- Rooms are persisted in SQLite at `ROOM_DB_PATH` (default `./data/rooms.sqlite`) and restored after restart; unfinished matches return to the lobby. SQLite is for a single application instance.
 
 ## Change Guidelines
 
@@ -108,7 +122,7 @@ render.yaml                Render deployment config
 - Source is ESM. The server build is CommonJS (`tsconfig.server.json`), so do not introduce top-level `await` in `server/` code.
 - Keep user-facing text in Russian and preserve the existing UI style.
 - Do not add comments unless they explain non-obvious behavior.
-- Secrets and Yandex/Upstash credentials must stay out of source and commits.
+- Secrets and Yandex credentials must stay out of source and commits. Do not commit `data/` or SQLite files.
 
 ## Tests
 

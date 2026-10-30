@@ -44,14 +44,15 @@ Revansh is an optional comeback mode:
 - TypeScript
 - Express
 - Socket.IO
+- SQLite via `node:sqlite`
 - Vitest
-- Optional Upstash Redis persistence
+- Docker
 
 ## Local Development
 
 Requirements:
 
-- Node.js 20 or newer.
+- Node.js 24 or newer.
 - npm.
 
 Install dependencies:
@@ -78,7 +79,28 @@ Open:
 http://127.0.0.1:5173
 ```
 
-## Production
+Rooms are stored locally in SQLite at `ROOM_DB_PATH` (default `./data/rooms.sqlite`). The `data/` directory is ignored by Git.
+
+## Docker
+
+Build and start the application with a persistent local database:
+
+```powershell
+Copy-Item .env.example .env
+docker compose up --build
+```
+
+Open:
+
+```text
+http://127.0.0.1:3001
+```
+
+Room data is kept in the `room-data` volume mounted at `/app/data`. `docker compose down` keeps the data; `docker compose down -v` removes it.
+
+The container runs the compiled Express server, which serves both the API and the built frontend from `dist`.
+
+## Production Without Docker
 
 Build the client and server:
 
@@ -100,14 +122,7 @@ Default URL:
 http://127.0.0.1:3001
 ```
 
-For Render or another Node host, use:
-
-```text
-Build command: npm install && npm run build
-Start command: npm start
-```
-
-The host must support WebSocket connections. Set `PORT` only when the platform does not provide it automatically.
+The host must support WebSocket connections. Set `PORT` only when the platform does not provide it automatically. Use a persistent filesystem for `ROOM_DB_PATH`; SQLite is intended for a single application instance.
 
 ## Environment Variables
 
@@ -116,16 +131,16 @@ The host must support WebSocket connections. Set `PORT` only when the platform d
 | `PORT` | `3001` | HTTP server port. |
 | `HOST` | `0.0.0.0` | HTTP bind address. |
 | `CLIENT_ORIGIN` | `http://127.0.0.1:5173` in development | Allowed Socket.IO and CORS origin. Production defaults to accepting the serving origin. |
+| `ROOM_DB_PATH` | `./data/rooms.sqlite` | SQLite database file for room snapshots. |
+| `ROOM_TTL_HOURS` | `72` | How long inactive room snapshots are kept. |
 | `YANDEX_MUSIC_TOKEN` | empty | Optional Yandex Music account token for requests that require it. |
 | `YANDEX_MUSIC_USE_DEMO` | `false` | Use demo tracks instead of external Yandex sources. |
 | `YANDEX_MUSIC_ALLOW_FULL_TRACK_FALLBACK` | `false` | Allow full-track fallback when a preview is unavailable. |
 | `AUDIO_DELIVERY_MODE` | `direct` | `direct` sends Yandex audio URLs to clients; `cache` downloads audio to the game server first. |
 | `AUDIO_CACHE_MAX_BYTES` | `8000000` | Maximum cached size of one audio file. |
 | `ROUND_AUDIO_WARMUP_MS` | `1750` for direct, `750` for cache | Delay before a round starts, allowing clients to prepare audio. |
-| `UPSTASH_REDIS_REST_URL` | empty | Optional Upstash Redis REST endpoint. |
-| `UPSTASH_REDIS_REST_TOKEN` | empty | Optional Upstash Redis REST token. |
 
-When both Upstash variables are configured, room snapshots are stored for 72 hours and restored after a server restart. Without Redis, rooms live only in server memory.
+Room snapshots are stored in SQLite and restored after a server restart. Unfinished matches return to the lobby.
 
 ## Audio Delivery
 
@@ -240,11 +255,13 @@ server/
   music.ts                 Yandex Music loading and source parsing
   audioDelivery.ts         direct/cache delivery selection
   audioCache.ts            in-memory audio cache and range responses
-  roomStore.ts             optional Upstash room persistence
+  roomStore.ts             local SQLite room persistence
   roundPlanning.ts         track-pool and synchronized-start planning
 scripts/
   probe-yandex-trailers.ts
   write-server-package.cjs
+Dockerfile                 multi-stage production image
+compose.yaml               single-container app with a data volume
 ```
 
 ## Operational Notes
@@ -253,4 +270,6 @@ scripts/
 - Direct Yandex URLs can behave differently across providers, VPNs, or corporate networks.
 - Cache mode is useful for network consistency but must be sized for the host's memory and outbound traffic limits.
 - A restarted server cannot restore prepared audio pools. Persisted rooms are restored safely, but unfinished matches return to the lobby.
-- Never commit `YANDEX_MUSIC_TOKEN` or Upstash credentials.
+- SQLite is intended for a single application instance. Do not run multiple replicas against the same database file.
+- Back up `rooms.sqlite` and its `-wal`/`-shm` files while the server is stopped, or use the SQLite backup API.
+- Never commit `YANDEX_MUSIC_TOKEN` or the local `data/` directory.

@@ -1,6 +1,7 @@
 node_modules/
 dist/
 dist-server/
+data/
 .tmp-server/
 yandex-music-api-3.0.0/
 *.har

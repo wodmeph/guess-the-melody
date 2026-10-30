@@ -13,7 +13,8 @@ import type { RoomSettings, Track, TrackMetadata } from './types';
 
 const port = Number(process.env.PORT ?? 3001);
 const host = process.env.HOST ?? '0.0.0.0';
-const clientOrigin = process.env.CLIENT_ORIGIN ?? (process.env.NODE_ENV === 'production' ? true : 'http://127.0.0.1:5173');
+const configuredClientOrigin = process.env.CLIENT_ORIGIN?.trim();
+const clientOrigin = configuredClientOrigin || (process.env.NODE_ENV === 'production' ? true : 'http://127.0.0.1:5173');
 
 const app = express();
 const httpServer = createServer(app);
@@ -347,10 +348,14 @@ io.on('connection', (socket) => {
   });
 });
 
-void bootstrap();
+void bootstrap().catch((error) => {
+  console.error(`Failed to start server: ${toClientError(error)}`);
+  roomStore.close();
+  process.exitCode = 1;
+});
 
 async function bootstrap(): Promise<void> {
-  const rooms = await roomStore.loadRooms();
+  const rooms = roomStore.loadRooms();
   if (rooms.length > 0) {
     engine.importRooms(rooms);
   }
@@ -359,6 +364,48 @@ async function bootstrap(): Promise<void> {
     console.log(`Server listening on http://${host}:${port}`);
   });
 }
+
+let shuttingDown = false;
+
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  console.log(`Received ${signal}; shutting down`);
+
+  for (const timer of roundTimers.values()) {
+    clearTimeout(timer);
+  }
+  for (const timer of nextRoundTimers.values()) {
+    clearTimeout(timer);
+  }
+  for (const timer of disconnectGraceTimers.values()) {
+    clearTimeout(timer);
+  }
+  roundTimers.clear();
+  nextRoundTimers.clear();
+  disconnectGraceTimers.clear();
+
+  try {
+    await persistRooms();
+  } catch (error) {
+    console.warn(toClientError(error));
+  }
+
+  await new Promise<void>((resolve) => {
+    io.close(() => resolve());
+    setTimeout(resolve, 5_000).unref();
+  });
+  roomStore.close();
+}
+
+process.once('SIGINT', () => {
+  void shutdown('SIGINT');
+});
+process.once('SIGTERM', () => {
+  void shutdown('SIGTERM');
+});
 
 async function resetRoomToLobby(code: string): Promise<ReturnType<GameEngine['resetToLobby']>> {
   clearRoundTimer(code);
@@ -603,6 +650,9 @@ function clampPage(value: number): number {
 }
 
 function parsePositiveInteger(value: string | undefined, fallback: number): number {
+  if (value === undefined || value.trim() === '') {
+    return fallback;
+  }
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) {
     return fallback;
@@ -611,6 +661,9 @@ function parsePositiveInteger(value: string | undefined, fallback: number): numb
 }
 
 function parseNonNegativeInteger(value: string | undefined, fallback: number): number {
+  if (value === undefined || value.trim() === '') {
+    return fallback;
+  }
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) {
     return fallback;

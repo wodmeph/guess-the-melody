@@ -1,0 +1,13 @@
+node_modules
+dist
+dist-server
+data
+coverage
+.tmp-server
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+*.log
+*.har

@@ -1,0 +1,30 @@
+services:
+  app:
+    build:
+      context: .
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      HOST: 0.0.0.0
+      ROOM_DB_PATH: /app/data/rooms.sqlite
+      ROOM_TTL_HOURS: ${ROOM_TTL_HOURS:-72}
+      YANDEX_MUSIC_TOKEN: ${YANDEX_MUSIC_TOKEN:-}
+      YANDEX_MUSIC_USE_DEMO: ${YANDEX_MUSIC_USE_DEMO:-false}
+      YANDEX_MUSIC_ALLOW_FULL_TRACK_FALLBACK: ${YANDEX_MUSIC_ALLOW_FULL_TRACK_FALLBACK:-false}
+      AUDIO_DELIVERY_MODE: ${AUDIO_DELIVERY_MODE:-direct}
+      AUDIO_CACHE_MAX_BYTES: ${AUDIO_CACHE_MAX_BYTES:-8000000}
+      ROUND_AUDIO_WARMUP_MS: ${ROUND_AUDIO_WARMUP_MS:-}
+    volumes:
+      - room-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3001/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  room-data:
