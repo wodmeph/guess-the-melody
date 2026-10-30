@@ -349,7 +349,8 @@ export class GameEngine {
     tracks: Track[],
     optionTracksOrDuration: TrackMetadata[] | number = tracks,
     durationMsOrNow?: number,
-    now = Date.now()
+    now = Date.now(),
+    correctCandidates?: Track[]
   ): QuestionInternal {
     const room = this.requireRoom(code);
     if (tracks.length < 4) {
@@ -359,8 +360,11 @@ export class GameEngine {
     const durationMs = Array.isArray(optionTracksOrDuration) ? durationMsOrNow : optionTracksOrDuration;
     const startedAt = Array.isArray(optionTracksOrDuration) ? now : (durationMsOrNow ?? now);
 
+    if (correctCandidates && correctCandidates.length === 0) {
+      throw new Error('No playable audio is available for the next round');
+    }
     const available = tracks.filter((track) => !room.usedTrackIds.has(track.id));
-    const correctPool = available.length > 0 ? available : tracks;
+    const correctPool = correctCandidates ?? (available.length > 0 ? available : tracks);
     const correctTrack = chooseCorrectTrack(correctPool, tracks, room.usedTrackIds);
     const answerMode = room.settings.answerMode;
     const selected = buildAnswerOptionCandidates(correctTrack, optionTracks, answerMode, room.round + 1, room.usedOptionTitles);

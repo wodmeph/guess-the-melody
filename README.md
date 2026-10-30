@@ -137,7 +137,8 @@ The host must support WebSocket connections. Set `PORT` only when the platform d
 | `YANDEX_MUSIC_USE_DEMO` | `false` | Use demo tracks instead of external Yandex sources. |
 | `YANDEX_MUSIC_ALLOW_FULL_TRACK_FALLBACK` | `false` | Allow full-track fallback when a preview is unavailable. |
 | `AUDIO_DELIVERY_MODE` | `direct` | `direct` sends Yandex audio URLs to clients; `cache` downloads audio to the game server first. |
-| `AUDIO_CACHE_MAX_BYTES` | `8000000` | Maximum cached size of one audio file. |
+| `AUDIO_CACHE_MAX_BYTES` | `8000000` | Maximum size of one clipped cached audio file. |
+| `AUDIO_CACHE_LOOKAHEAD` | `2` | In `cache` mode, how many future tracks are kept ready besides the current track. `0` prefetches only the next track after the current round starts. |
 | `ROUND_AUDIO_WARMUP_MS` | `1750` for direct, `750` for cache | Delay before a round starts, allowing clients to prepare audio. |
 
 Room snapshots are stored in SQLite and restored after a server restart. Unfinished matches return to the lobby.
@@ -158,14 +159,26 @@ Clients load audio directly from the upstream Yandex URL. This reduces server ba
 AUDIO_DELIVERY_MODE=cache
 ```
 
-The server downloads playable audio before the game and serves it through `/api/audio/:id`. This gives all players the same host and can help when individual networks have trouble reaching Yandex, but it increases server bandwidth and memory usage.
+The server downloads playable audio ahead of a game and serves it through `/api/audio/:id`. This gives all players the same host and can help when individual networks have trouble reaching Yandex, but it increases server bandwidth and memory usage.
+
+Cache mode accepts only MP3. Non-MP3 sources are skipped and the next candidate is tried. The server keeps a bounded window of prepared tracks instead of the whole pool:
+
+- before a round, it caches the current track plus `AUDIO_CACHE_LOOKAHEAD` future tracks;
+- after a round starts, it prefetches another future track in the background;
+- the current track stays available until the result screen appears, then it is released;
+- a finished or reset game clears the room window and cache.
+
+Each cached track is clipped to the question duration (`questionDurationMs`, at most 30 seconds) on MP3 frame boundaries. No transcoding is performed. When the upstream supports streaming, the server stops reading as soon as enough frames arrive; otherwise it downloads the response and discards the extra data. `AUDIO_CACHE_MAX_BYTES` limits the already-clipped file.
 
 The cache:
 
 - accepts only HTTPS upstream URLs;
 - supports HTTP range requests;
-- deduplicates identical upstream audio;
+- deduplicates identical upstream audio and concurrent downloads;
+- re-caches a track when a longer clip is requested;
 - removes room references when a room is cleared.
+
+Peak memory per room is approximately `(AUDIO_CACHE_LOOKAHEAD + 2) × <clipped file size>`. A 10-second MP3 at 320 kbit/s is about 400 KB; 30 seconds is about 1.2 MB.
 
 ## Supported Yandex Music Sources
 
@@ -255,6 +268,8 @@ server/
   music.ts                 Yandex Music loading and source parsing
   audioDelivery.ts         direct/cache delivery selection
   audioCache.ts            in-memory audio cache and range responses
+  audioWindow.ts           bounded cache window state and prefetching
+  mp3Clip.ts               MP3 frame parsing, clipping, and streaming download
   roomStore.ts             local SQLite room persistence
   roundPlanning.ts         track-pool and synchronized-start planning
 scripts/

@@ -1107,4 +1107,24 @@ describe('GameEngine', () => {
     expect(finalRoom.status).toBe('finished');
     expect(finalRoom.matchMoments.some((moment) => moment.id.startsWith('moment-steal-'))).toBe(false);
   });
+
+  it('chooses the correct track only from the supplied candidates', () => {
+    const engine = new GameEngine(() => 'ROOM42');
+    engine.createRoom({ playerId: 'host', playerName: 'Host' });
+    const candidate = tracks[2];
+
+    const question = engine.startNextRound('ROOM42', tracks, 10_000, 1000, undefined, [candidate]);
+
+    expect(question.correctOptionId).toBe(candidate.id);
+    expect(question.correctTrack).toEqual(candidate);
+  });
+
+  it('rejects an empty correct-candidate list instead of falling back to the whole pool', () => {
+    const engine = new GameEngine(() => 'ROOM42');
+    engine.createRoom({ playerId: 'host', playerName: 'Host' });
+
+    expect(() => engine.startNextRound('ROOM42', tracks, 10_000, 1000, undefined, [])).toThrow(
+      'No playable audio is available for the next round'
+    );
+  });
 });

@@ -4,8 +4,9 @@ export type AudioDeliveryMode = 'direct' | 'cache';
 
 type PrepareTrackAudioOptions = {
   mode: AudioDeliveryMode;
-  cacheTrackAudio: (roomCode: string, upstreamUrl: string) => Promise<string>;
+  cacheTrackAudio: (roomCode: string, upstreamUrl: string, options?: { maxDurationMs?: number }) => Promise<string>;
   minPlayable?: number;
+  clipDurationMs?: number;
   onCacheError?: (track: Track, error: unknown) => void;
 };
 
@@ -27,7 +28,9 @@ export async function prepareTrackAudio(roomCode: string, tracks: Track[], optio
         try {
           return {
             ...track,
-            audioUrl: await options.cacheTrackAudio(roomCode, track.audioUrl)
+            audioUrl: await options.cacheTrackAudio(roomCode, track.audioUrl, {
+              maxDurationMs: options.clipDurationMs
+            })
           };
         } catch (error) {
           options.onCacheError?.(track, error);

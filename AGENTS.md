@@ -85,6 +85,8 @@ server/
   music.ts                 Yandex Music sources, themes, search, probing
   audioDelivery.ts         direct vs cache audio delivery selection
   audioCache.ts            in-memory audio cache and range responses
+  audioWindow.ts           bounded cache window state, cursor, and prefetch fill
+  mp3Clip.ts               MP3 frame parsing, clipping, and streaming download
   roomStore.ts             local SQLite room persistence
   roundPlanning.ts         track-pool limits and synchronized round start
   *.test.ts                colocated Vitest unit tests
@@ -111,6 +113,7 @@ eslint.config.js           ESLint flat config
 - UI routes: `/room/<CODE>` (normal), `/room/<CODE>/display` (TV), `/room/<CODE>/player` (phone).
 - REST endpoints: `/api/health`, `/api/themes`, `/api/music/playlists/search`, `/api/music/diagnostics`, `/api/music/probe`, `/api/audio/:id`.
 - Audio can be delivered directly from Yandex URLs or through the server cache. Changing delivery affects warmup timing and playback behavior.
+- Cache mode accepts only MP3, clips each track to the question duration (max 30 seconds), and keeps a bounded window of `AUDIO_CACHE_LOOKAHEAD + 1` future tracks. The current track is released after reveal. Non-MP3 sources are skipped.
 - Rooms are persisted in SQLite at `ROOM_DB_PATH` (default `./data/rooms.sqlite`) and restored after restart; unfinished matches return to the lobby. SQLite is for a single application instance.
 
 ## Change Guidelines

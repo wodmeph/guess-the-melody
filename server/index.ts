@@ -5,6 +5,7 @@ import path from 'node:path';
 import { Server } from 'socket.io';
 import { AudioCache } from './audioCache';
 import { prepareTrackAudio, resolveAudioDeliveryMode } from './audioDelivery';
+import { AudioWindowState, fillAudioWindow } from './audioWindow';
 import { GameEngine } from './game';
 import { MusicService } from './music';
 import { RoomStore } from './roomStore';
@@ -25,6 +26,7 @@ const io = new Server(httpServer, {
   }
 });
 const audioCacheMaxBytes = parsePositiveInteger(process.env.AUDIO_CACHE_MAX_BYTES, 8_000_000);
+const audioCacheLookahead = Math.min(parseNonNegativeInteger(process.env.AUDIO_CACHE_LOOKAHEAD, 2), 20);
 const audioDeliveryMode = resolveAudioDeliveryMode();
 const roundAudioWarmupMs = parseNonNegativeInteger(process.env.ROUND_AUDIO_WARMUP_MS, audioDeliveryMode === 'direct' ? 1_750 : 750);
 
@@ -34,6 +36,8 @@ const audioCache = new AudioCache({ maxBytes: audioCacheMaxBytes });
 const roomStore = new RoomStore();
 const roomTracks = new Map<string, Track[]>();
 const roomOptionTracks = new Map<string, TrackMetadata[]>();
+const roomAudioWindows = new Map<string, AudioWindowState>();
+const roomAudioRefillJobs = new Map<string, Promise<void>>();
 const roundTimers = new Map<string, NodeJS.Timeout>();
 const nextRoundTimers = new Map<string, NodeJS.Timeout>();
 const roomPoolLoadTokens = new Map<string, number>();
@@ -177,10 +181,12 @@ io.on('connection', (socket) => {
   });
 
   socket.on('start_game', async ({ code, playerId }: { code: string; playerId: string }, callback) => {
+    let markedPreparing = false;
     try {
       requireSocketPlayer(socket.id, code, playerId);
       engine.assertHost(code, playerId);
       const preparingRoom = engine.markPreparing(code);
+      markedPreparing = true;
       await persistRooms();
       io.to(preparingRoom.code).emit('room_state', preparingRoom);
 
@@ -202,7 +208,10 @@ io.on('connection', (socket) => {
         }
       );
       audioCache.clearRoom(preparingRoom.code);
-      roomTracks.set(preparingRoom.code, shuffle(await prepareRoomTrackAudio(preparingRoom.code, pool.playableTracks)));
+      resetRoomAudioState(preparingRoom.code);
+      const playableTracks =
+        audioDeliveryMode === 'cache' ? pool.playableTracks : await prepareRoomTrackAudio(preparingRoom.code, pool.playableTracks);
+      roomTracks.set(preparingRoom.code, shuffle(playableTracks));
       roomOptionTracks.set(preparingRoom.code, shuffle(pool.optionTracks));
       await startRound(preparingRoom.code);
       if (trackPoolPlan.shouldLoadInBackground) {
@@ -210,6 +219,9 @@ io.on('connection', (socket) => {
       }
       callback?.({ data: engine.getPublicRoom(preparingRoom.code) });
     } catch (error) {
+      if (markedPreparing) {
+        await rollbackPreparingRoom(code);
+      }
       callback?.({ error: toClientError(error) });
     }
   });
@@ -269,6 +281,7 @@ io.on('connection', (socket) => {
       } else if (result.deletedRoomCode) {
         roomTracks.delete(result.deletedRoomCode);
         roomOptionTracks.delete(result.deletedRoomCode);
+        resetRoomAudioState(result.deletedRoomCode);
         clearRoundTimer(result.deletedRoomCode);
         clearNextRoundTimer(result.deletedRoomCode);
         roomPoolLoadTokens.delete(result.deletedRoomCode);
@@ -413,16 +426,36 @@ async function resetRoomToLobby(code: string): Promise<ReturnType<GameEngine['re
   const room = engine.resetToLobby(code);
   roomTracks.delete(room.code);
   roomOptionTracks.delete(room.code);
+  resetRoomAudioState(room.code);
   audioCache.clearRoom(room.code);
   nextPoolLoadToken(room.code);
   await persistRooms();
   return room;
 }
 
-async function prepareRoomTrackAudio(code: string, tracks: Track[]): Promise<Track[]> {
+async function rollbackPreparingRoom(code: string): Promise<void> {
+  try {
+    const room = engine.getPublicRoom(code.toUpperCase());
+    if (room.status !== 'preparing') {
+      return;
+    }
+    const restored = await resetRoomToLobby(room.code);
+    io.to(restored.code).emit('room_state', restored);
+  } catch (error) {
+    console.warn(`[game] failed to roll back room ${code.toUpperCase()}: ${toClientError(error)}`);
+  }
+}
+
+async function prepareRoomTrackAudio(
+  code: string,
+  tracks: Track[],
+  options: { minPlayable?: number; clipDurationMs?: number } = {}
+): Promise<Track[]> {
   return prepareTrackAudio(code, tracks, {
     mode: audioDeliveryMode,
-    cacheTrackAudio: (roomCode, upstreamUrl) => audioCache.cacheTrackAudio(roomCode, upstreamUrl),
+    cacheTrackAudio: (roomCode, upstreamUrl, cacheOptions) => audioCache.cacheTrackAudio(roomCode, upstreamUrl, cacheOptions),
+    minPlayable: options.minPlayable,
+    clipDurationMs: options.clipDurationMs,
     onCacheError: (track, error) => {
       console.warn(`[audio] failed to cache ${track.id} for ${code.toUpperCase()}: ${toClientError(error)}`);
     }
@@ -451,8 +484,12 @@ async function hydrateRoomTrackPool(
 
     const currentTracks = roomTracks.get(room.code) ?? [];
     const currentOptions = roomOptionTracks.get(room.code) ?? [];
-    const preparedTracks = await prepareRoomTrackAudio(room.code, pool.playableTracks);
-    roomTracks.set(room.code, shuffle(mergeUniqueById(currentTracks, preparedTracks)));
+    if (audioDeliveryMode === 'cache') {
+      roomTracks.set(room.code, mergeUniqueById(currentTracks, pool.playableTracks));
+      void refillAudioWindow(room.code).catch(() => undefined);
+    } else {
+      roomTracks.set(room.code, shuffle(mergeUniqueById(currentTracks, pool.playableTracks)));
+    }
     roomOptionTracks.set(room.code, shuffle(mergeUniqueByTitle(currentOptions, pool.optionTracks)));
     console.log(`[music] hydrated room ${room.code}: ${roomTracks.get(room.code)?.length ?? 0} playable tracks`);
   } catch (error) {
@@ -470,8 +507,21 @@ async function startRound(code: string): Promise<void> {
     throw new Error('No track pool prepared for room');
   }
 
-  engine.startNextRound(room.code, tracks, optionTracks, undefined, planRoundStart(Date.now(), roundAudioWarmupMs));
+  let correctCandidates: Track[] | undefined;
+  if (audioDeliveryMode === 'cache') {
+    await ensureAudioWindow(room.code);
+    const state = getAudioWindowState(room.code);
+    if (state.size() === 0) {
+      throw new Error('No cached audio is available for the next round');
+    }
+    correctCandidates = state.candidates();
+  }
+
+  const question = engine.startNextRound(room.code, tracks, optionTracks, undefined, planRoundStart(Date.now(), roundAudioWarmupMs), correctCandidates);
   const updated = engine.getPublicRoom(room.code);
+  if (audioDeliveryMode === 'cache') {
+    takeCurrentAudio(room.code, question.correctTrack);
+  }
   finalizeRoundStart({
     publish: () => {
       io.to(room.code).emit('round_started', updated);
@@ -480,6 +530,15 @@ async function startRound(code: string): Promise<void> {
     schedule: () => {
       const timer = setTimeout(() => {
         const revealed = engine.revealRound(room.code);
+        if (audioDeliveryMode === 'cache') {
+          releaseCurrentAudio(room.code);
+          if (revealed.status === 'finished') {
+            resetRoomAudioState(room.code);
+            audioCache.clearRoom(room.code);
+          } else {
+            void refillAudioWindow(room.code).catch(() => undefined);
+          }
+        }
         void persistRooms();
         io.to(room.code).emit('round_result', revealed);
         io.to(room.code).emit('room_state', revealed);
@@ -491,6 +550,115 @@ async function startRound(code: string): Promise<void> {
     },
     persist: persistRooms
   });
+  if (audioDeliveryMode === 'cache') {
+    void refillAudioWindow(room.code).catch(() => undefined);
+  }
+}
+
+async function ensureAudioWindow(code: string): Promise<void> {
+  if (audioDeliveryMode !== 'cache') {
+    return;
+  }
+  await refillAudioWindow(code);
+}
+
+function refillAudioWindow(code: string): Promise<void> {
+  const normalizedCode = code.toUpperCase();
+  const state = getAudioWindowState(normalizedCode);
+  const generation = state.generationValue();
+  const previous = roomAudioRefillJobs.get(normalizedCode) ?? Promise.resolve();
+  const job = previous
+    .catch(() => undefined)
+    .then(async () => {
+      if (!state.isGenerationCurrent(generation)) {
+        return;
+      }
+      await fillRoomAudioWindow(normalizedCode, state);
+    });
+  const tracked = job.finally(() => {
+    if (roomAudioRefillJobs.get(normalizedCode) === tracked) {
+      roomAudioRefillJobs.delete(normalizedCode);
+    }
+  });
+  roomAudioRefillJobs.set(normalizedCode, tracked);
+  return tracked;
+}
+
+async function fillRoomAudioWindow(code: string, state: AudioWindowState): Promise<void> {
+  const tracks = roomTracks.get(code);
+  if (!tracks) {
+    return;
+  }
+
+  let questionDurationMs: number;
+  try {
+    questionDurationMs = engine.getPublicRoom(code).settings.questionDurationMs;
+  } catch {
+    return;
+  }
+
+  await fillAudioWindow({
+    state,
+    tracks,
+    targetSize: audioCacheLookahead + 1,
+    prepare: async (track) => {
+      const prepared = await prepareRoomTrackAudio(code, [track], {
+        minPlayable: 1,
+        clipDurationMs: questionDurationMs
+      });
+      return prepared[0];
+    },
+    onOrphan: (track) => removePreparedAudioIfUnused(code, state, track)
+  });
+}
+
+function getAudioWindowState(code: string): AudioWindowState {
+  const normalizedCode = code.toUpperCase();
+  let state = roomAudioWindows.get(normalizedCode);
+  if (!state) {
+    state = new AudioWindowState();
+    roomAudioWindows.set(normalizedCode, state);
+  }
+  return state;
+}
+
+function removePreparedAudioIfUnused(code: string, state: AudioWindowState, preparedTrack: Track): void {
+  const liveState = roomAudioWindows.get(code.toUpperCase());
+  if (state.isLocalUrlInUse(preparedTrack.audioUrl) || (liveState && liveState.isLocalUrlInUse(preparedTrack.audioUrl))) {
+    return;
+  }
+  const cacheId = localAudioId(preparedTrack.audioUrl);
+  if (cacheId) {
+    audioCache.remove(cacheId);
+  }
+}
+
+function takeCurrentAudio(code: string, correctTrack: Track): void {
+  getAudioWindowState(code).takeCurrent(correctTrack);
+}
+
+function releaseCurrentAudio(code: string): void {
+  const state = roomAudioWindows.get(code.toUpperCase());
+  const current = state?.releaseCurrent();
+  if (!current) {
+    return;
+  }
+  const cacheId = localAudioId(current.track.audioUrl);
+  if (cacheId) {
+    audioCache.remove(cacheId);
+  } else {
+    audioCache.removeByUrl(current.upstreamUrl, code.toUpperCase());
+  }
+}
+
+function resetRoomAudioState(code: string): void {
+  const normalizedCode = code.toUpperCase();
+  roomAudioWindows.get(normalizedCode)?.reset();
+  roomAudioWindows.delete(normalizedCode);
+}
+
+function localAudioId(audioUrl: string): string | undefined {
+  return /^\/api\/audio\/([a-f0-9-]{36})$/i.exec(audioUrl)?.[1];
 }
 
 function scheduleNextRound(code: string): void {

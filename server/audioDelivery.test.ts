@@ -44,4 +44,43 @@ describe('audio delivery', () => {
       '/api/audio/preview195'
     ]);
   });
+
+  it('passes the clip duration to the cache and skips failed tracks', async () => {
+    const cacheTrackAudio = vi.fn(
+      async (_roomCode: string, audioUrl: string, options?: { maxDurationMs?: number }) => {
+        if (audioUrl.includes('preview193')) {
+          throw new Error('Unsupported audio format: expected mp3');
+        }
+        return `/api/audio/${audioUrl.split('/').at(-1)}-${options?.maxDurationMs}`;
+      }
+    );
+    const onCacheError = vi.fn();
+
+    const prepared = await prepareTrackAudio('ROOM42', tracks, {
+      mode: 'cache',
+      cacheTrackAudio,
+      clipDurationMs: 15_000,
+      minPlayable: 1,
+      onCacheError
+    });
+
+    expect(cacheTrackAudio).toHaveBeenCalledTimes(4);
+    expect(cacheTrackAudio).toHaveBeenCalledWith('ROOM42', tracks[0].audioUrl, { maxDurationMs: 15_000 });
+    expect(prepared).toHaveLength(3);
+    expect(onCacheError).toHaveBeenCalledTimes(1);
+  });
+
+  it('requires at least one playable cached track for a small window', async () => {
+    const cacheTrackAudio = vi.fn(async () => {
+      throw new Error('Unsupported audio format: expected mp3');
+    });
+
+    await expect(
+      prepareTrackAudio('ROOM42', tracks.slice(0, 1), {
+        mode: 'cache',
+        cacheTrackAudio,
+        minPlayable: 1
+      })
+    ).rejects.toThrow('Could not cache enough playable audio tracks');
+  });
 });
