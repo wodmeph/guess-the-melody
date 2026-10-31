@@ -109,7 +109,7 @@ eslint.config.js           ESLint flat config
 - `server/game.ts` contains the game rules. Keep transport concerns out of it.
 - `server/index.ts` owns Express routes, Socket.IO events, in-memory room maps, and timers. Add new client commands here.
 - Client-to-server commands currently include `create_room`, `create_display_room`, `join_room`, `view_room`, `update_settings`, `start_game`, `submit_answer`, `next_round`, `set_auto_next_round`, `reset_game`, `reset_display_game`, `kick_player`, `leave_room`.
-- Server-to-client events currently include `room_state`, `round_started`, `round_result`, `answer_received`, `kicked`.
+- Server-to-client events currently include `room_state`, `round_started`, `round_result`, `kicked`.
 - UI routes: `/room/<CODE>` (normal), `/room/<CODE>/display` (TV), `/room/<CODE>/player` (phone).
 - REST endpoints: `/api/health`, `/api/themes`, `/api/music/playlists/search`, `/api/music/diagnostics`, `/api/music/probe`, `/api/audio/:id`.
 - Audio can be delivered directly from Yandex URLs or through the server cache. Changing delivery affects warmup timing and playback behavior.

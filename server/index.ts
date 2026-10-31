@@ -38,14 +38,19 @@ const roomTracks = new Map<string, Track[]>();
 const roomOptionTracks = new Map<string, TrackMetadata[]>();
 const roomAudioWindows = new Map<string, AudioWindowState>();
 const roomAudioRefillJobs = new Map<string, Promise<void>>();
+const roomAbortControllers = new Map<string, AbortController>();
 const roundTimers = new Map<string, NodeJS.Timeout>();
 const nextRoundTimers = new Map<string, NodeJS.Timeout>();
 const roomPoolLoadTokens = new Map<string, number>();
 const socketPlayers = new Map<string, { roomCode: string; playerId: string }>();
 const playerSockets = new Map<string, Set<string>>();
 const disconnectGraceTimers = new Map<string, NodeJS.Timeout>();
+const dirtyRoomCodes = new Set<string>();
+const roomLastActivity = new Map<string, number>();
+let roomSweepTimer: NodeJS.Timeout | undefined;
 
 const DISCONNECT_GRACE_MS = 8_000;
+const PERSISTENCE_DEBOUNCE_MS = 400;
 
 app.use(cors({ origin: clientOrigin }));
 app.use(express.json({ limit: '16kb' }));
@@ -108,7 +113,7 @@ app.get('/api/audio/:id', (request, response) => {
     return;
   }
 
-  response.status(cached.status).set(cached.headers).send(cached.body);
+  response.status(cached.status).set(cached.headers).set('ETag', `"${id}"`).send(cached.body);
 });
 
 app.use(express.static(path.join(process.cwd(), 'dist')));
@@ -123,7 +128,8 @@ io.on('connection', (socket) => {
       socket.join(playerId);
       socket.join(room.code);
       bindSocketPlayer(socket.id, room.code, playerId);
-      await persistRooms();
+      markRoomDirty(room.code);
+      await flushPersistence();
       callback?.({ data: room });
       io.to(room.code).emit('room_state', room);
     } catch (error) {
@@ -135,7 +141,7 @@ io.on('connection', (socket) => {
     try {
       const room = engine.createDisplayRoom();
       socket.join(room.code);
-      await persistRooms();
+      markRoomDirty(room.code);
       callback?.({ data: room });
       io.to(room.code).emit('room_state', room);
     } catch (error) {
@@ -149,7 +155,8 @@ io.on('connection', (socket) => {
       socket.join(playerId);
       socket.join(room.code);
       bindSocketPlayer(socket.id, room.code, playerId);
-      await persistRooms();
+      markRoomDirty(room.code);
+      await flushPersistence();
       callback?.({ data: room });
       io.to(room.code).emit('room_state', room);
     } catch (error) {
@@ -160,6 +167,7 @@ io.on('connection', (socket) => {
   socket.on('view_room', ({ code }: { code: string }, callback) => {
     try {
       const room = engine.getPublicRoom(code.toUpperCase());
+      roomLastActivity.set(room.code, Date.now());
       socket.join(room.code);
       callback?.({ data: room });
     } catch (error) {
@@ -172,7 +180,7 @@ io.on('connection', (socket) => {
       requireSocketPlayer(socket.id, code, playerId);
       engine.assertHost(code, playerId);
       const room = engine.updateSettings(code, parseSettings(settings));
-      await persistRooms();
+      markRoomDirty(room.code);
       callback?.({ data: room });
       io.to(room.code).emit('room_state', room);
     } catch (error) {
@@ -187,7 +195,9 @@ io.on('connection', (socket) => {
       engine.assertHost(code, playerId);
       const preparingRoom = engine.markPreparing(code);
       markedPreparing = true;
-      await persistRooms();
+      resetRoomRuntimeState(preparingRoom.code);
+      markRoomDirty(preparingRoom.code);
+      await flushPersistence();
       io.to(preparingRoom.code).emit('room_state', preparingRoom);
 
       const plannedRounds = preparingRoom.settings.winCondition === 'score' ? estimateRoundsForScore(preparingRoom.settings.targetScore) : preparingRoom.settings.rounds;
@@ -207,17 +217,23 @@ io.on('connection', (socket) => {
           optionLimit: trackPoolPlan.initialOptionLimit
         }
       );
+      if (roomPoolLoadTokens.get(preparingRoom.code) !== loadToken) {
+        throw new Error('Game start was cancelled');
+      }
       audioCache.clearRoom(preparingRoom.code);
       resetRoomAudioState(preparingRoom.code);
       const playableTracks =
         audioDeliveryMode === 'cache' ? pool.playableTracks : await prepareRoomTrackAudio(preparingRoom.code, pool.playableTracks);
+      if (roomPoolLoadTokens.get(preparingRoom.code) !== loadToken) {
+        throw new Error('Game start was cancelled');
+      }
       roomTracks.set(preparingRoom.code, shuffle(playableTracks));
       roomOptionTracks.set(preparingRoom.code, shuffle(pool.optionTracks));
-      await startRound(preparingRoom.code);
+      const startedRoom = await startRound(preparingRoom.code);
       if (trackPoolPlan.shouldLoadInBackground) {
         void hydrateRoomTrackPool(preparingRoom.code, loadToken, source, plannedRounds);
       }
-      callback?.({ data: engine.getPublicRoom(preparingRoom.code) });
+      callback?.({ data: startedRoom });
     } catch (error) {
       if (markedPreparing) {
         await rollbackPreparingRoom(code);
@@ -231,9 +247,8 @@ io.on('connection', (socket) => {
       requireSocketPlayer(socket.id, code, playerId);
       const result = engine.submitAnswer(code, playerId, optionId);
       const room = engine.getPublicRoom(code);
-      await persistRooms();
+      markRoomDirty(room.code);
       callback?.({ data: { optionId: result.optionId } });
-      io.to(room.code).emit('answer_received', { playerId });
       io.to(room.code).emit('room_state', room);
     } catch (error) {
       callback?.({ error: toClientError(error) });
@@ -246,7 +261,7 @@ io.on('connection', (socket) => {
       try {
         requireSocketPlayer(socket.id, code, playerId);
         const room = engine.activateComebackAbility(code, playerId, ability, counterPrediction);
-        await persistRooms();
+        markRoomDirty(room.code);
         callback?.({ data: room });
         io.to(room.code).emit('room_state', room);
       } catch (error) {
@@ -259,7 +274,7 @@ io.on('connection', (socket) => {
     try {
       requireSocketPlayer(socket.id, code, hostPlayerId);
       const room = engine.kickPlayer(code, hostPlayerId, targetPlayerId);
-      await persistRooms();
+      markRoomDirty(room.code);
       callback?.({ data: room });
       io.to(targetPlayerId).emit('kicked', { message: 'Хост удалил вас из комнаты' });
       io.to(room.code).emit('room_state', room);
@@ -274,18 +289,13 @@ io.on('connection', (socket) => {
       const result = engine.leaveRoom(code, playerId);
       socket.leave(code.toUpperCase());
       unbindSocketPlayer(socket.id);
-      await persistRooms();
       callback?.({ data: null });
       if (result.room) {
+        markRoomDirty(result.room.code);
+        await flushPersistence();
         io.to(result.room.code).emit('room_state', result.room);
       } else if (result.deletedRoomCode) {
-        roomTracks.delete(result.deletedRoomCode);
-        roomOptionTracks.delete(result.deletedRoomCode);
-        resetRoomAudioState(result.deletedRoomCode);
-        clearRoundTimer(result.deletedRoomCode);
-        clearNextRoundTimer(result.deletedRoomCode);
-        roomPoolLoadTokens.delete(result.deletedRoomCode);
-        audioCache.clearRoom(result.deletedRoomCode);
+        disposeRoom(result.deletedRoomCode);
       }
     } catch (error) {
       callback?.({ error: toClientError(error) });
@@ -296,8 +306,8 @@ io.on('connection', (socket) => {
     try {
       requireSocketPlayer(socket.id, code, playerId);
       engine.assertHost(code, playerId);
-      await startRound(code);
-      callback?.({ data: engine.getPublicRoom(code) });
+      const room = await startRound(code);
+      callback?.({ data: room });
     } catch (error) {
       callback?.({ error: toClientError(error) });
     }
@@ -313,7 +323,7 @@ io.on('connection', (socket) => {
       } else {
         clearNextRoundTimer(room.code);
       }
-      await persistRooms();
+      markRoomDirty(room.code);
       callback?.({ data: room });
       io.to(room.code).emit('room_state', room);
     } catch (error) {
@@ -371,7 +381,13 @@ async function bootstrap(): Promise<void> {
   const rooms = roomStore.loadRooms();
   if (rooms.length > 0) {
     engine.importRooms(rooms);
+    for (const code of engine.listRoomCodes()) {
+      roomLastActivity.set(code, Date.now());
+    }
   }
+
+  roomSweepTimer = setInterval(() => sweepIdleRooms(), 5 * 60 * 1000);
+  roomSweepTimer.unref();
 
   httpServer.listen(port, host, () => {
     console.log(`Server listening on http://${host}:${port}`);
@@ -399,9 +415,13 @@ async function shutdown(signal: string): Promise<void> {
   roundTimers.clear();
   nextRoundTimers.clear();
   disconnectGraceTimers.clear();
+  if (roomSweepTimer) {
+    clearInterval(roomSweepTimer);
+    roomSweepTimer = undefined;
+  }
 
   try {
-    await persistRooms();
+    await flushPersistence();
   } catch (error) {
     console.warn(toClientError(error));
   }
@@ -420,16 +440,80 @@ process.once('SIGTERM', () => {
   void shutdown('SIGTERM');
 });
 
+function resetRoomRuntimeState(code: string): void {
+  const normalizedCode = code.toUpperCase();
+  clearRoundTimer(normalizedCode);
+  clearNextRoundTimer(normalizedCode);
+  roomTracks.delete(normalizedCode);
+  roomOptionTracks.delete(normalizedCode);
+  roomAudioRefillJobs.delete(normalizedCode);
+  roomAbortControllers.get(normalizedCode)?.abort();
+  roomAbortControllers.delete(normalizedCode);
+  audioCache.abortRoomDownloads(normalizedCode);
+  nextPoolLoadToken(normalizedCode);
+  resetRoomAudioState(normalizedCode);
+  audioCache.clearRoom(normalizedCode);
+}
+
+function disposeRoom(code: string): void {
+  const normalizedCode = code.toUpperCase();
+  resetRoomRuntimeState(normalizedCode);
+  engine.removeRoom(normalizedCode);
+  roomStore.deleteRoom(normalizedCode);
+  roomLastActivity.delete(normalizedCode);
+  roomPoolLoadTokens.delete(normalizedCode);
+  dirtyRoomCodes.delete(normalizedCode);
+
+  for (const [socketId, binding] of socketPlayers) {
+    if (binding.roomCode !== normalizedCode) {
+      continue;
+    }
+    socketPlayers.delete(socketId);
+    io.sockets.sockets.get(socketId)?.leave(normalizedCode);
+  }
+  const playerKeyPrefix = `${normalizedCode}:`;
+  for (const key of playerSockets.keys()) {
+    if (key.startsWith(playerKeyPrefix)) {
+      playerSockets.delete(key);
+    }
+  }
+  for (const [key, timer] of disconnectGraceTimers) {
+    if (key.startsWith(playerKeyPrefix)) {
+      clearTimeout(timer);
+      disconnectGraceTimers.delete(key);
+    }
+  }
+}
+
+function sweepIdleRooms(now = Date.now()): void {
+  for (const code of engine.listRoomCodes()) {
+    let room: ReturnType<GameEngine['getPublicRoom']>;
+    try {
+      room = engine.getPublicRoom(code);
+    } catch {
+      continue;
+    }
+    if (room.players.some((player) => player.connected)) {
+      continue;
+    }
+    if ((io.sockets.adapter.rooms.get(code)?.size ?? 0) > 0) {
+      continue;
+    }
+    const lastActivityAt = roomLastActivity.get(code) ?? now;
+    if (now - lastActivityAt <= roomStore.ttlMs) {
+      continue;
+    }
+    console.log(`[storage] removing idle room ${code}`);
+    disposeRoom(code);
+  }
+  roomStore.deleteExpiredRooms(new Set(engine.listRoomCodes()));
+}
+
 async function resetRoomToLobby(code: string): Promise<ReturnType<GameEngine['resetToLobby']>> {
-  clearRoundTimer(code);
-  clearNextRoundTimer(code);
   const room = engine.resetToLobby(code);
-  roomTracks.delete(room.code);
-  roomOptionTracks.delete(room.code);
-  resetRoomAudioState(room.code);
-  audioCache.clearRoom(room.code);
-  nextPoolLoadToken(room.code);
-  await persistRooms();
+  resetRoomRuntimeState(room.code);
+  markRoomDirty(room.code);
+  await flushPersistence();
   return room;
 }
 
@@ -451,9 +535,11 @@ async function prepareRoomTrackAudio(
   tracks: Track[],
   options: { minPlayable?: number; clipDurationMs?: number } = {}
 ): Promise<Track[]> {
+  const signal = getRoomAbortSignal(code);
   return prepareTrackAudio(code, tracks, {
     mode: audioDeliveryMode,
-    cacheTrackAudio: (roomCode, upstreamUrl, cacheOptions) => audioCache.cacheTrackAudio(roomCode, upstreamUrl, cacheOptions),
+    cacheTrackAudio: (roomCode, upstreamUrl, cacheOptions) =>
+      audioCache.cacheTrackAudio(roomCode, upstreamUrl, { ...cacheOptions, signal }),
     minPlayable: options.minPlayable,
     clipDurationMs: options.clipDurationMs,
     onCacheError: (track, error) => {
@@ -469,9 +555,12 @@ async function hydrateRoomTrackPool(
   plannedRounds: number
 ): Promise<void> {
   try {
+    const limits = planTrackPoolLimits(plannedRounds);
+    const excludeTrackIds = new Set((roomTracks.get(code.toUpperCase()) ?? []).map((track) => track.id));
     const pool = await music.prepareTrackPool(source, {
-      playableLimit: planTrackPoolLimits(plannedRounds).backgroundPlayableLimit,
-      optionLimit: planTrackPoolLimits(plannedRounds).backgroundOptionLimit
+      playableLimit: limits.backgroundPlayableLimit,
+      optionLimit: limits.backgroundOptionLimit,
+      excludeTrackIds
     });
     if (pool.isFallback) {
       console.warn(`[music] background pool load for ${code.toUpperCase()} returned fallback; keeping current room pool`);
@@ -497,7 +586,7 @@ async function hydrateRoomTrackPool(
   }
 }
 
-async function startRound(code: string): Promise<void> {
+async function startRound(code: string): Promise<ReturnType<GameEngine['getPublicRoom']>> {
   clearRoundTimer(code);
   clearNextRoundTimer(code);
   const room = engine.getPublicRoom(code);
@@ -517,6 +606,11 @@ async function startRound(code: string): Promise<void> {
     correctCandidates = state.candidates();
   }
 
+  const latestRoom = engine.getPublicRoom(room.code);
+  if (latestRoom.status !== 'preparing' && latestRoom.status !== 'round-result') {
+    throw new Error('Round start was cancelled');
+  }
+
   const question = engine.startNextRound(room.code, tracks, optionTracks, undefined, planRoundStart(Date.now(), roundAudioWarmupMs), correctCandidates);
   const updated = engine.getPublicRoom(room.code);
   if (audioDeliveryMode === 'cache') {
@@ -525,7 +619,6 @@ async function startRound(code: string): Promise<void> {
   finalizeRoundStart({
     publish: () => {
       io.to(room.code).emit('round_started', updated);
-      io.to(room.code).emit('room_state', updated);
     },
     schedule: () => {
       const timer = setTimeout(() => {
@@ -533,26 +626,31 @@ async function startRound(code: string): Promise<void> {
         if (audioDeliveryMode === 'cache') {
           releaseCurrentAudio(room.code);
           if (revealed.status === 'finished') {
-            resetRoomAudioState(room.code);
-            audioCache.clearRoom(room.code);
+            resetRoomRuntimeState(room.code);
           } else {
             void refillAudioWindow(room.code).catch(() => undefined);
           }
         }
-        void persistRooms();
+        markRoomDirty(room.code);
+        if (revealed.status === 'finished') {
+          void flushPersistence();
+        }
         io.to(room.code).emit('round_result', revealed);
-        io.to(room.code).emit('room_state', revealed);
         scheduleNextRound(revealed.code);
         roundTimers.delete(room.code);
       }, Math.max(0, (updated.currentQuestion?.endsAt ?? Date.now() + room.settings.questionDurationMs) - Date.now()));
 
       roundTimers.set(room.code, timer);
     },
-    persist: persistRooms
+    persist: () => {
+      markRoomDirty(code);
+      return Promise.resolve();
+    }
   });
   if (audioDeliveryMode === 'cache') {
     void refillAudioWindow(room.code).catch(() => undefined);
   }
+  return updated;
 }
 
 async function ensureAudioWindow(code: string): Promise<void> {
@@ -610,6 +708,19 @@ async function fillRoomAudioWindow(code: string, state: AudioWindowState): Promi
     },
     onOrphan: (track) => removePreparedAudioIfUnused(code, state, track)
   });
+}
+
+function getRoomAbortSignal(code: string): AbortSignal {
+  const normalizedCode = code.toUpperCase();
+  let controller = roomAbortControllers.get(normalizedCode);
+  if (!controller) {
+    if (!engine.hasRoom(normalizedCode)) {
+      throw new Error('Room is no longer available');
+    }
+    controller = new AbortController();
+    roomAbortControllers.set(normalizedCode, controller);
+  }
+  return controller.signal;
 }
 
 function getAudioWindowState(code: string): AudioWindowState {
@@ -799,7 +910,7 @@ async function markPlayerDisconnected(roomCode: string, playerId: string): Promi
   if (!room) {
     return;
   }
-  await persistRooms();
+  markRoomDirty(room.code);
   io.to(room.code).emit('room_state', room);
 }
 
@@ -847,11 +958,49 @@ function toClientError(error: unknown): string {
   return error instanceof Error ? error.message : 'Unexpected server error';
 }
 
-async function persistRooms(): Promise<void> {
+let persistenceTimer: NodeJS.Timeout | undefined;
+
+function schedulePersistence(): void {
+  if (persistenceTimer || shuttingDown) {
+    return;
+  }
+  persistenceTimer = setTimeout(() => {
+    persistenceTimer = undefined;
+    void flushPersistence();
+  }, PERSISTENCE_DEBOUNCE_MS);
+  persistenceTimer.unref();
+}
+
+function markRoomDirty(code: string): void {
+  const normalizedCode = code.toUpperCase();
+  dirtyRoomCodes.add(normalizedCode);
+  roomLastActivity.set(normalizedCode, Date.now());
+  schedulePersistence();
+}
+
+async function flushPersistence(): Promise<void> {
+  if (persistenceTimer) {
+    clearTimeout(persistenceTimer);
+    persistenceTimer = undefined;
+  }
+  if (dirtyRoomCodes.size === 0) {
+    return;
+  }
+
+  const codes = [...dirtyRoomCodes];
+  dirtyRoomCodes.clear();
+  const rooms = codes
+    .map((code) => engine.exportRoom(code))
+    .filter((room): room is NonNullable<typeof room> => Boolean(room));
+
   try {
-    await roomStore.saveRooms(engine.exportRooms());
+    roomStore.saveRoomsIncremental(rooms);
   } catch (error) {
+    for (const code of codes) {
+      dirtyRoomCodes.add(code);
+    }
     console.warn(toClientError(error));
+    schedulePersistence();
   }
 }
 

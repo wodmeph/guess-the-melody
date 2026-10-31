@@ -19,11 +19,14 @@ type RoomStoreOptions = {
 
 export class RoomStore {
   private readonly db: DatabaseSync;
-  private readonly ttlMs: number;
+  readonly ttlMs: number;
   private readonly now: () => number;
   private readonly deleteAll: StatementSync;
   private readonly insertRoom: StatementSync;
+  private readonly upsertRoom: StatementSync;
+  private readonly deleteRoomRow: StatementSync;
   private readonly deleteExpired: StatementSync;
+  private readonly selectExpiredCodes: StatementSync;
   private readonly selectRooms: StatementSync;
   private closed = false;
 
@@ -52,7 +55,13 @@ export class RoomStore {
 
     this.deleteAll = this.db.prepare('DELETE FROM rooms');
     this.insertRoom = this.db.prepare('INSERT INTO rooms (code, snapshot, updated_at) VALUES (?, ?, ?)');
+    this.upsertRoom = this.db.prepare(`
+      INSERT INTO rooms (code, snapshot, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(code) DO UPDATE SET snapshot = excluded.snapshot, updated_at = excluded.updated_at
+    `);
+    this.deleteRoomRow = this.db.prepare('DELETE FROM rooms WHERE code = ?');
     this.deleteExpired = this.db.prepare('DELETE FROM rooms WHERE updated_at < ?');
+    this.selectExpiredCodes = this.db.prepare('SELECT code FROM rooms WHERE updated_at < ?');
     this.selectRooms = this.db.prepare('SELECT snapshot FROM rooms ORDER BY updated_at');
   }
 
@@ -69,6 +78,45 @@ export class RoomStore {
       this.db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  saveRoom(room: SerializedRoom): void {
+    this.upsertRoom.run(room.code, JSON.stringify(room), this.now());
+  }
+
+  saveRoomsIncremental(rooms: SerializedRoom[]): void {
+    if (rooms.length === 0) {
+      return;
+    }
+    const updatedAt = this.now();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const room of rooms) {
+        this.upsertRoom.run(room.code, JSON.stringify(room), updatedAt);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  deleteRoom(code: string): void {
+    this.deleteRoomRow.run(code.toUpperCase());
+  }
+
+  deleteExpiredRooms(protectedCodes: ReadonlySet<string> = new Set()): number {
+    const cutoff = this.now() - this.ttlMs;
+    const expired = this.selectExpiredCodes.all(cutoff) as Array<{ code: string }>;
+    let deleted = 0;
+    for (const { code } of expired) {
+      if (protectedCodes.has(code.toUpperCase())) {
+        continue;
+      }
+      this.deleteRoomRow.run(code);
+      deleted += 1;
+    }
+    return deleted;
   }
 
   loadRooms(): SerializedRoom[] {

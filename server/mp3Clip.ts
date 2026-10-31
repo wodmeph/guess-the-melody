@@ -1,4 +1,5 @@
 export const MAX_MP3_CLIP_MS = 30_000;
+export const UPSTREAM_FETCH_TIMEOUT_MS = 15_000;
 
 const MAX_FRAME_BYTES = 8_192;
 const MAX_FORMAT_PROBE_BYTES = 64 * 1024;
@@ -233,9 +234,34 @@ export function clipMp3Buffer(input: Buffer, targetMs: number, maxBytes: number)
 export async function downloadMp3Clip(
   fetcher: typeof fetch,
   url: string,
-  options: { targetMs: number; maxBytes: number }
+  options: { targetMs: number; maxBytes: number; signal?: AbortSignal; timeoutMs?: number }
 ): Promise<Mp3Clip> {
   const controller = new AbortController();
+  const timeoutMs = options.timeoutMs ?? UPSTREAM_FETCH_TIMEOUT_MS;
+  const externalSignal = options.signal;
+  const abortFromExternal = () => controller.abort(externalSignal?.reason);
+  const timeout = setTimeout(() => controller.abort(new Error('Audio download timed out')), timeoutMs);
+  timeout.unref();
+  if (externalSignal?.aborted) {
+    controller.abort(externalSignal.reason);
+  } else {
+    externalSignal?.addEventListener('abort', abortFromExternal, { once: true });
+  }
+
+  try {
+    return await downloadWithController(fetcher, url, options, controller);
+  } finally {
+    clearTimeout(timeout);
+    externalSignal?.removeEventListener('abort', abortFromExternal);
+  }
+}
+
+async function downloadWithController(
+  fetcher: typeof fetch,
+  url: string,
+  options: { targetMs: number; maxBytes: number },
+  controller: AbortController
+): Promise<Mp3Clip> {
   const accept = 'audio/mpeg, audio/*;q=0.9, */*;q=0.8';
   let response = await fetcher(url, {
     headers: {

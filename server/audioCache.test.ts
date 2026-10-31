@@ -118,6 +118,53 @@ describe('AudioCache', () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps a shared download alive when one subscriber aborts', async () => {
+    let resolveResponse: ((value: Response) => void) | undefined;
+    let upstreamSignal: AbortSignal | undefined;
+    const fetcher = vi.fn(
+      (_url: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((resolve) => {
+          upstreamSignal = init?.signal ?? undefined;
+          resolveResponse = resolve;
+        })
+    );
+    const cache = new AudioCache({ fetcher });
+    const aborted = new AbortController();
+
+    const first = cache.cacheTrackAudio('ROOM42', UPSTREAM_URL, { maxDurationMs: 1_000, signal: aborted.signal });
+    const second = cache.cacheTrackAudio('ROOM42', UPSTREAM_URL, { maxDurationMs: 1_000 });
+    await vi.waitFor(() => expect(resolveResponse).toBeDefined());
+    aborted.abort();
+
+    await expect(first).rejects.toThrow('Audio download aborted');
+    expect(upstreamSignal?.aborted).toBe(false);
+
+    resolveResponse?.(response(mp3Frames(100)));
+
+    await expect(second).resolves.toMatch(/^\/api\/audio\/[a-f0-9-]+$/);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts pending downloads for a disposed room', async () => {
+    let upstreamSignal: AbortSignal | undefined;
+    const fetcher = vi.fn(
+      (_url: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          upstreamSignal = init?.signal ?? undefined;
+          upstreamSignal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+        })
+    );
+    const cache = new AudioCache({ fetcher });
+
+    const pending = cache.cacheTrackAudio('ROOM42', UPSTREAM_URL, { maxDurationMs: 1_000 });
+    await vi.waitFor(() => expect(upstreamSignal).toBeDefined());
+
+    cache.abortRoomDownloads('ROOM42');
+
+    expect(upstreamSignal?.aborted).toBe(true);
+    await expect(pending).rejects.toThrow();
+  });
+
   it('rejects oversized clipped audio', async () => {
     const cache = new AudioCache({
       maxBytes: 500,

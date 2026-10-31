@@ -211,6 +211,38 @@ describe('mp3 clipping', () => {
     expect(cancelled).toBe(true);
   });
 
+  it('aborts a stalled upstream request by timeout', async () => {
+    const fetcher = vi.fn(
+      (_url: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+        })
+    );
+
+    await expect(
+      downloadMp3Clip(fetcher, 'https://example.test/track.mp3', { targetMs: 100, maxBytes: 10_000, timeoutMs: 20 })
+    ).rejects.toThrow();
+  });
+
+  it('aborts a download through an external signal', async () => {
+    const controller = new AbortController();
+    const fetcher = vi.fn(
+      (_url: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+        })
+    );
+
+    const pending = downloadMp3Clip(fetcher, 'https://example.test/track.mp3', {
+      targetMs: 100,
+      maxBytes: 10_000,
+      signal: controller.signal
+    });
+    controller.abort();
+
+    await expect(pending).rejects.toThrow();
+  });
+
   it('cancels the download when maxBytes is exceeded', async () => {
     let cancelled = false;
     const fetcher = vi.fn(async () =>

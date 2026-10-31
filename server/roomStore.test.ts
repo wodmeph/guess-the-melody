@@ -82,6 +82,53 @@ describe('RoomStore', () => {
     expect(store.loadRooms()).toEqual([]);
   });
 
+  it('upserts individual rooms and deletes them without touching the rest', () => {
+    const [first, second] = createRooms();
+    const store = createStore();
+
+    store.saveRooms([first, second]);
+    store.saveRoom({ ...first, round: 3 });
+    store.deleteRoom(second.code);
+
+    const rooms = store.loadRooms();
+
+    expect(rooms).toHaveLength(1);
+    expect(rooms[0]).toEqual({ ...first, round: 3 });
+  });
+
+  it('updates updated_at only for the saved room', () => {
+    let now = 1_000_000;
+    const [first, second] = createRooms();
+    const store = createStore({ now: () => now });
+
+    store.saveRooms([first, second]);
+    now += 5_000;
+    store.saveRoom({ ...first, round: 2 });
+
+    const database = new DatabaseSync(dbPath);
+    const rows = database.prepare('SELECT code, updated_at FROM rooms ORDER BY code').all() as Array<{ code: string; updated_at: number }>;
+    database.close();
+
+    expect(rows).toEqual([
+      { code: first.code, updated_at: 1_005_000 },
+      { code: second.code, updated_at: 1_000_000 }
+    ]);
+  });
+
+  it('deletes only expired room rows', () => {
+    let now = 1_000_000;
+    const [first, second] = createRooms();
+    const store = createStore({ ttlMs: 1_000, now: () => now });
+
+    store.saveRooms([first, second]);
+    now += 500;
+    store.saveRoom({ ...second, round: 2 });
+    now += 600;
+
+    expect(store.deleteExpiredRooms()).toBe(1);
+    expect(store.loadRooms()).toEqual([{ ...second, round: 2 }]);
+  });
+
   it('skips corrupt snapshots without failing', () => {
     const store = createStore();
     store.saveRooms(createRooms(1));

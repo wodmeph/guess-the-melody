@@ -28,18 +28,11 @@ type RoundHistoryAnswer = {
   playerId: string;
   playerName: string;
   optionId: string;
-  firstOptionId: string;
-  previousOptionId?: string;
   isCorrect: boolean;
   responseMs: number;
   firstResponseMs: number;
-  lastResponseMs: number;
   points: number;
   answerChanges: number;
-  answerEvents: PlayerAnswerResult['answerEvents'];
-  wasOnCorrectAnswer: boolean;
-  leftCorrectAnswer: boolean;
-  changedToCorrectAnswer: boolean;
 };
 
 type ScoredAchievement = Achievement & {
@@ -63,6 +56,7 @@ type Room = {
   roundDrama: RoundDrama[];
   comeback: ComebackState;
   round: number;
+  matchMoments?: MatchMoment[];
 };
 
 export type SerializedRoom = {
@@ -474,6 +468,7 @@ export class GameEngine {
     this.applyRoundScores(room);
     const finished = isGameFinished(room);
     room.status = finished ? 'finished' : 'round-result';
+    room.matchMoments = finished && room.settings.achievementsEnabled ? buildMatchMoments(room.roundHistory) : undefined;
     if (!finished) {
       this.queueAutomaticJammer(room);
     }
@@ -494,6 +489,7 @@ export class GameEngine {
     room.roundHistory = [];
     room.roundDrama = [];
     room.comeback = {};
+    room.matchMoments = undefined;
     for (const player of room.players.values()) {
       player.score = 0;
       player.correctAnswers = 0;
@@ -579,19 +575,24 @@ export class GameEngine {
   }
 
   exportRooms(): SerializedRoom[] {
-    return [...this.rooms.values()].map((room) => ({
-      code: room.code,
-      status: room.status,
-      settings: room.settings,
-      players: [...room.players.values()],
-      currentQuestion: room.currentQuestion,
-      usedTrackIds: [...room.usedTrackIds],
-      usedOptionTitles: [...room.usedOptionTitles],
-      roundHistory: room.roundHistory,
-      roundDrama: room.roundDrama,
-      comeback: room.comeback,
-      round: room.round
-    }));
+    return [...this.rooms.values()].map((room) => serializeRoom(room));
+  }
+
+  listRoomCodes(): string[] {
+    return [...this.rooms.keys()];
+  }
+
+  hasRoom(code: string): boolean {
+    return this.rooms.has(code.toUpperCase());
+  }
+
+  exportRoom(code: string): SerializedRoom | undefined {
+    const room = this.rooms.get(code.toUpperCase());
+    return room ? serializeRoom(room) : undefined;
+  }
+
+  removeRoom(code: string): boolean {
+    return this.rooms.delete(code.toUpperCase());
   }
 
   importRooms(rooms: SerializedRoom[]): void {
@@ -633,6 +634,9 @@ export class GameEngine {
         comeback: snapshot.comeback ?? {},
         round: restoredStatus === 'finished' ? snapshot.round : 0
       };
+      if (restoredStatus === 'finished' && room.settings.achievementsEnabled) {
+        room.matchMoments = buildMatchMoments(room.roundHistory);
+      }
       this.ensureHost(room);
       this.rooms.set(room.code, room);
     }
@@ -812,6 +816,22 @@ export class GameEngine {
   }
 }
 
+function serializeRoom(room: Room): SerializedRoom {
+  return {
+    code: room.code,
+    status: room.status,
+    settings: room.settings,
+    players: [...room.players.values()],
+    currentQuestion: room.currentQuestion,
+    usedTrackIds: [...room.usedTrackIds],
+    usedOptionTitles: [...room.usedOptionTitles],
+    roundHistory: room.roundHistory,
+    roundDrama: room.roundDrama,
+    comeback: room.comeback,
+    round: room.round
+  };
+}
+
 function toPublicRoom(room: Room, revealCorrectTrack = false): PublicRoom {
   const question = room.currentQuestion
     ? {
@@ -835,7 +855,10 @@ function toPublicRoom(room: Room, revealCorrectTrack = false): PublicRoom {
     currentQuestion: question,
     correctTrack: revealCorrectTrack ? room.currentQuestion?.correctTrack : undefined,
     achievements: room.settings.achievementsEnabled ? buildAchievements(room, revealCorrectTrack) : [],
-    matchMoments: room.settings.achievementsEnabled && room.status === 'finished' ? buildMatchMoments(room.roundHistory) : [],
+    matchMoments:
+      room.settings.achievementsEnabled && room.status === 'finished'
+        ? (room.matchMoments ??= buildMatchMoments(room.roundHistory))
+        : [],
     roundDrama: revealCorrectTrack ? room.roundDrama : [],
     comeback: room.settings.comebackMode ? room.comeback : undefined,
     round: room.round,
@@ -1333,18 +1356,11 @@ function createRoundHistoryEntry(room: Room, question: QuestionInternal): RoundH
         playerId: player.id,
         playerName: player.name,
         optionId: player.lastAnswer.optionId,
-        firstOptionId: player.lastAnswer.firstOptionId,
-        previousOptionId: player.lastAnswer.previousOptionId,
         isCorrect: player.lastAnswer.isCorrect,
         responseMs: player.lastAnswer.responseMs,
         firstResponseMs: player.lastAnswer.firstResponseMs,
-        lastResponseMs: player.lastAnswer.lastResponseMs,
         points: player.lastAnswer.points,
-        answerChanges: player.lastAnswer.answerChanges,
-        answerEvents: player.lastAnswer.answerEvents,
-        wasOnCorrectAnswer: player.lastAnswer.answerEvents.some((event) => event.optionId === question.correctOptionId),
-        leftCorrectAnswer: player.lastAnswer.answerEvents.some((event) => event.optionId === question.correctOptionId) && !player.lastAnswer.isCorrect,
-        changedToCorrectAnswer: player.lastAnswer.firstOptionId !== question.correctOptionId && player.lastAnswer.isCorrect
+        answerChanges: player.lastAnswer.answerChanges
       }))
   };
 }

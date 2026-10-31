@@ -1,4 +1,4 @@
-import { useMemo, type CSSProperties } from 'react';
+import { useEffect, useMemo, type CSSProperties } from 'react';
 
 export type Star = {
   x: number;
@@ -36,9 +36,9 @@ export function createStars(count: number, seed: number): Star[] {
 }
 
 const layers = [
-  { name: 'far', count: 260, seed: 42 },
-  { name: 'middle', count: 90, seed: 31415 },
-  { name: 'near', count: 34, seed: 271828 }
+  { name: 'far', count: 110, seed: 42 },
+  { name: 'middle', count: 50, seed: 31415 },
+  { name: 'near', count: 24, seed: 271828 }
 ] as const;
 
 export function Starfield() {
@@ -46,6 +46,18 @@ export function Starfield() {
     () => layers.map((layer) => ({ ...layer, stars: createStars(layer.count, layer.seed) })),
     []
   );
+
+  useEffect(() => {
+    const sync = () => {
+      document.documentElement.classList.toggle('document-hidden', document.hidden);
+    };
+    sync();
+    document.addEventListener('visibilitychange', sync);
+    return () => {
+      document.removeEventListener('visibilitychange', sync);
+      document.documentElement.classList.remove('document-hidden');
+    };
+  }, []);
 
   return (
     <div className="starfield" aria-hidden="true">

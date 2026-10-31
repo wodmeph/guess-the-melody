@@ -1,10 +1,14 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto';
+import { UPSTREAM_FETCH_TIMEOUT_MS } from './mp3Clip';
 import type { PlaylistSearchItem, PlaylistSource, Theme, Track, TrackMetadata } from './types';
 
 const YANDEX_API_BASE = 'https://api.music.yandex.net';
 const DOWNLOAD_SIGN_SALT = 'XGRlBW9FXlekgbPrRHuSiA';
 const GET_FILE_INFO_SECRET_KEY = '7tvSmFbyf5hJnIHhCimDDD';
 const GET_FILE_INFO_CODECS = ['flac', 'aac', 'he-aac', 'mp3', 'flac-mp4', 'aac-mp4', 'he-aac-mp4'];
+const RESOLVED_AUDIO_URL_TTL_MS = 10 * 60 * 1000;
+const RESOLVED_AUDIO_URL_PRUNE_THRESHOLD = 2_000;
+const AUDIO_RESOLVE_CONCURRENCY = 4;
 
 type YandexResponse<T> = {
   result?: T;
@@ -264,6 +268,7 @@ export class MusicService {
   private readonly allowFullTrackFallback = process.env.YANDEX_MUSIC_ALLOW_FULL_TRACK_FALLBACK === 'true';
   private lastFallbackReason: string | undefined;
   private lastLoadStats: TrackLoadStats | undefined;
+  private readonly resolvedAudioUrls = new Map<string, { url: string; expiresAt: number }>();
 
   getThemes(): Theme[] {
     return THEMES.map(({ chartId: _chartId, playlistQueries: _playlistQueries, metatagIds: _metatagIds, stationIds: _stationIds, ...theme }) => theme);
@@ -280,7 +285,10 @@ export class MusicService {
     };
   }
 
-  async prepareTrackPool(source: TrackSourceInput, options: { playableLimit: number; optionLimit: number }): Promise<TrackPool> {
+  async prepareTrackPool(
+    source: TrackSourceInput,
+    options: { playableLimit: number; optionLimit: number; excludeTrackIds?: ReadonlySet<string> }
+  ): Promise<TrackPool> {
     const playlistSources = typeof source === 'string' ? [] : normalizePlaylistSources(source.playlistSources, source.playlistUrls, source.playlistUrl);
     const difficulty = typeof source === 'string' ? 'easy' : source.difficulty ?? 'easy';
     const themeIds =
@@ -295,24 +303,14 @@ export class MusicService {
     }
 
     try {
-      const candidates = uniqueByTrackId(await this.getSourceCandidates(themeIds, playlistSources));
+      const excludeTrackIds = options.excludeTrackIds;
+      const allCandidates = uniqueByTrackId(await this.getSourceCandidates(themeIds, playlistSources));
+      const candidates = excludeTrackIds
+        ? allCandidates.filter((candidate) => !excludeTrackIds.has(String(candidate.id)))
+        : allCandidates;
       const optionTracks = uniqueByTitle(candidates.map(toTrackMetadata)).slice(0, options.optionLimit);
-      const playableTracks: Track[] = [];
       const stats = createTrackLoadStats(candidates.length, optionTracks.length, difficulty);
-
-      for (const candidate of candidates) {
-        const audioUrl = await this.resolveAudioUrl(candidate, difficulty, stats);
-        if (audioUrl) {
-          playableTracks.push({
-            ...toTrackMetadata(candidate),
-            audioUrl
-          });
-        }
-
-        if (playableTracks.length >= options.playableLimit) {
-          break;
-        }
-      }
+      const playableTracks = await this.resolvePlayableTracks(candidates, difficulty, options.playableLimit, stats);
 
       if (playableTracks.length >= 4 && optionTracks.length >= 4) {
         this.lastFallbackReason = undefined;
@@ -625,7 +623,65 @@ export class MusicService {
     return extractTracks(playlist.tracks).slice(0, 700);
   }
 
+  private async resolvePlayableTracks(
+    candidates: YandexTrack[],
+    difficulty: 'easy' | 'hard',
+    limit: number,
+    stats: TrackLoadStats
+  ): Promise<Track[]> {
+    const resolved = new Map<number, Track>();
+    let nextIndex = 0;
+    const worker = async (): Promise<void> => {
+      while (resolved.size < limit) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const candidate = candidates[index];
+        if (!candidate) {
+          return;
+        }
+        const audioUrl = await this.resolveAudioUrl(candidate, difficulty, stats);
+        if (audioUrl) {
+          resolved.set(index, { ...toTrackMetadata(candidate), audioUrl });
+        }
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: Math.min(AUDIO_RESOLVE_CONCURRENCY, candidates.length) }, () => worker())
+    );
+    return [...resolved.entries()]
+      .sort(([left], [right]) => left - right)
+      .slice(0, limit)
+      .map(([, track]) => track);
+  }
+
   private async resolveAudioUrl(track: YandexTrack, difficulty: 'easy' | 'hard', stats?: TrackLoadStats): Promise<string | undefined> {
+    if (this.resolvedAudioUrls.size > RESOLVED_AUDIO_URL_PRUNE_THRESHOLD) {
+      const now = Date.now();
+      for (const [key, entry] of this.resolvedAudioUrls) {
+        if (entry.expiresAt <= now) {
+          this.resolvedAudioUrls.delete(key);
+        }
+      }
+    }
+
+    const cacheKey = `${String(track.id)}:${difficulty}`;
+    const cached = this.resolvedAudioUrls.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.url;
+    }
+    if (cached) {
+      this.resolvedAudioUrls.delete(cacheKey);
+    }
+
+    const audioUrl = await this.resolveAudioUrlUncached(track, difficulty, stats);
+    if (audioUrl) {
+      this.resolvedAudioUrls.set(cacheKey, { url: audioUrl, expiresAt: Date.now() + RESOLVED_AUDIO_URL_TTL_MS });
+    }
+    return audioUrl;
+  }
+
+  private async resolveAudioUrlUncached(track: YandexTrack, difficulty: 'easy' | 'hard', stats?: TrackLoadStats): Promise<string | undefined> {
     if (difficulty === 'hard') {
       const fullTrackUrl = await this.tryDownloadInfoAudioUrl(track.id);
       if (fullTrackUrl) {
@@ -741,7 +797,8 @@ export class MusicService {
 
   private async get<T>(path: string): Promise<T> {
     const response = await fetch(`${YANDEX_API_BASE}${path}`, {
-      headers: this.headers()
+      headers: this.headers(),
+      signal: AbortSignal.timeout(UPSTREAM_FETCH_TIMEOUT_MS)
     });
 
     if (!response.ok) {
@@ -757,7 +814,8 @@ export class MusicService {
 
   private async getRaw<T>(path: string, headers = this.headers()): Promise<T> {
     const response = await fetch(`${YANDEX_API_BASE}${path}`, {
-      headers
+      headers,
+      signal: AbortSignal.timeout(UPSTREAM_FETCH_TIMEOUT_MS)
     });
 
     if (!response.ok) {
@@ -813,7 +871,7 @@ export function createGetFileInfoSign({
 }
 
 async function fetchText(url: string, headers: Record<string, string>): Promise<string> {
-  const response = await fetch(url, { headers });
+  const response = await fetch(url, { headers, signal: AbortSignal.timeout(UPSTREAM_FETCH_TIMEOUT_MS) });
   if (!response.ok) {
     throw new Error(`Download info XML failed: ${response.status}`);
   }
@@ -842,16 +900,18 @@ function readXmlTag(xml: string, tag: string): string | undefined {
   return match?.[1];
 }
 
-function findAudioUrl(value: unknown): string | undefined {
+const MAX_AUDIO_URL_SEARCH_DEPTH = 8;
+
+function findAudioUrl(value: unknown, depth = 0): string | undefined {
   if (typeof value === 'string') {
     return /^https?:\/\/.+\.(mp3|m4a|aac|ogg)(\?.*)?$/i.test(value) ? value : undefined;
   }
-  if (!value || typeof value !== 'object') {
+  if (!value || typeof value !== 'object' || depth >= MAX_AUDIO_URL_SEARCH_DEPTH) {
     return undefined;
   }
 
   for (const item of Object.values(value)) {
-    const found = findAudioUrl(item);
+    const found = findAudioUrl(item, depth + 1);
     if (found) {
       return found;
     }
@@ -1047,13 +1107,19 @@ function shuffle<T>(items: T[]): T[] {
 
 function interleaveSourceGroups<T>(groups: T[][]): T[] {
   const result: T[] = [];
-  const queues = groups.map((group) => [...group]);
-  while (queues.some((queue) => queue.length > 0)) {
-    for (const queue of queues) {
-      const item = queue.shift();
-      if (item) {
-        result.push(item);
+  const cursors = groups.map(() => 0);
+  let remaining = groups.reduce((total, group) => total + group.length, 0);
+
+  while (remaining > 0) {
+    for (let index = 0; index < groups.length; index += 1) {
+      const group = groups[index];
+      const cursor = cursors[index];
+      if (cursor >= group.length) {
+        continue;
       }
+      result.push(group[cursor]);
+      cursors[index] = cursor + 1;
+      remaining -= 1;
     }
   }
   return result;

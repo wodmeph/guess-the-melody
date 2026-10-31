@@ -433,8 +433,8 @@ function App() {
     };
 
     socket.on('room_state', handleRoomState);
-    socket.on('round_started', setRoom);
-    socket.on('round_result', setRoom);
+    socket.on('round_started', handleRoomState);
+    socket.on('round_result', handleRoomState);
     socket.on('connect', rejoinCurrentRoom);
     socket.on('disconnect', handleDisconnect);
     socket.on('connect_error', handleConnectError);
@@ -449,8 +449,8 @@ function App() {
 
     return () => {
       socket.off('room_state', handleRoomState);
-      socket.off('round_started', setRoom);
-      socket.off('round_result', setRoom);
+      socket.off('round_started', handleRoomState);
+      socket.off('round_result', handleRoomState);
       socket.off('connect', rejoinCurrentRoom);
       socket.off('disconnect', handleDisconnect);
       socket.off('connect_error', handleConnectError);
@@ -2959,27 +2959,58 @@ function useQuestionCountdown(
 ) {
   const [now, setNow] = useState(() => Date.now());
   const serverOffsetRef = useRef(0);
+  const endsAt = endsAtOverride ?? question.endsAt;
 
   useEffect(() => {
     serverOffsetRef.current = serverTime - Date.now();
-    setNow(Date.now());
+    let intervalId: number | undefined;
 
-    let frameId = 0;
-
-    const tick = () => {
-      setNow(Date.now());
-      frameId = window.requestAnimationFrame(tick);
+    const stop = () => {
+      if (intervalId === undefined) {
+        return;
+      }
+      window.clearInterval(intervalId);
+      intervalId = undefined;
     };
 
-    frameId = window.requestAnimationFrame(tick);
+    const sync = () => {
+      const current = Date.now();
+      setNow(current);
+      if (current + serverOffsetRef.current >= endsAt) {
+        stop();
+      }
+    };
 
-    return () => window.cancelAnimationFrame(frameId);
-  }, [question.id, serverTime]);
+    const start = () => {
+      if (intervalId !== undefined || document.hidden) {
+        return;
+      }
+      sync();
+      if (Date.now() + serverOffsetRef.current < endsAt) {
+        intervalId = window.setInterval(sync, 250);
+      }
+    };
+
+    const handleVisibility = () => {
+      if (document.hidden) {
+        stop();
+      } else {
+        start();
+      }
+    };
+
+    start();
+    document.addEventListener('visibilitychange', handleVisibility);
+
+    return () => {
+      stop();
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [question.id, serverTime, endsAt]);
 
   const adjustedNow = now + serverOffsetRef.current;
   const isPendingStart = adjustedNow < question.startedAt;
   const durationMs = Math.max(1, durationOverrideMs ?? question.durationMs);
-  const endsAt = endsAtOverride ?? question.endsAt;
   const activeNow = Math.max(adjustedNow, question.startedAt);
   const remaining = Math.max(0, endsAt - activeNow);
   const progress = clamp(remaining / durationMs, 0, 1);
@@ -3062,7 +3093,7 @@ function useAutoNextCountdown(status: Room['status'], round: number, enabled = t
     const interval = window.setInterval(() => {
       const elapsed = Math.floor((Date.now() - startedAt) / 1000);
       setSecondsLeft(Math.max(0, 10 - elapsed));
-    }, 250);
+    }, 1_000);
 
     return () => window.clearInterval(interval);
   }, [status, round, enabled]);

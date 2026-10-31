@@ -14,6 +14,13 @@ type AudioCacheEntry = {
 
 type CacheTrackAudioOptions = {
   maxDurationMs?: number;
+  signal?: AbortSignal;
+};
+
+type PendingDownload = {
+  promise: Promise<string>;
+  controller: AbortController;
+  subscribers: number;
 };
 
 export type CachedAudioResponse = {
@@ -31,7 +38,7 @@ export class AudioCache {
   private readonly entries = new Map<string, AudioCacheEntry>();
   private readonly idsByUpstreamUrl = new Map<string, string>();
   private readonly idsByRoom = new Map<string, Set<string>>();
-  private readonly pendingDownloads = new Map<string, Promise<string>>();
+  private readonly pendingDownloads = new Map<string, PendingDownload>();
 
   constructor({ fetcher = fetch, maxBytes = 2_000_000 }: { fetcher?: Fetcher; maxBytes?: number } = {}) {
     this.fetcher = fetcher;
@@ -39,6 +46,9 @@ export class AudioCache {
   }
 
   async cacheTrackAudio(roomCode: string, upstreamUrl: string, options: CacheTrackAudioOptions = {}): Promise<string> {
+    if (options.signal?.aborted) {
+      throw abortError();
+    }
     const normalizedRoomCode = roomCode.toUpperCase();
     const url = normalizeAudioUrl(upstreamUrl);
     const clipDurationMs = clampClipDuration(options.maxDurationMs);
@@ -58,17 +68,29 @@ export class AudioCache {
     const pendingKey = `${cacheKey}:${clipDurationMs}`;
     const pending = this.pendingDownloads.get(pendingKey);
     if (pending) {
-      return pending;
+      return this.joinPendingDownload(pendingKey, pending, options.signal);
     }
 
-    const job = this.downloadAndStore(normalizedRoomCode, url, cacheKey, clipDurationMs);
-    this.pendingDownloads.set(pendingKey, job);
-    try {
-      return await job;
-    } finally {
-      if (this.pendingDownloads.get(pendingKey) === job) {
-        this.pendingDownloads.delete(pendingKey);
+    const controller = new AbortController();
+    const job = this.downloadAndStore(normalizedRoomCode, url, cacheKey, clipDurationMs, controller.signal);
+    job.catch(() => undefined);
+    const record: PendingDownload = { promise: job, controller, subscribers: 0 };
+    this.pendingDownloads.set(pendingKey, record);
+    job.then(
+      () => this.releasePendingRecord(pendingKey, record),
+      () => this.releasePendingRecord(pendingKey, record)
+    );
+    return this.joinPendingDownload(pendingKey, record, options.signal);
+  }
+
+  abortRoomDownloads(roomCode: string): void {
+    const prefix = `${roomCode.toUpperCase()}:`;
+    for (const [key, record] of this.pendingDownloads) {
+      if (!key.startsWith(prefix)) {
+        continue;
       }
+      this.pendingDownloads.delete(key);
+      record.controller.abort();
     }
   }
 
@@ -132,10 +154,51 @@ export class AudioCache {
     this.idsByRoom.delete(normalizedRoomCode);
   }
 
-  private async downloadAndStore(roomCode: string, url: string, cacheKey: string, clipDurationMs: number): Promise<string> {
+  private async joinPendingDownload(pendingKey: string, record: PendingDownload, signal?: AbortSignal): Promise<string> {
+    if (signal?.aborted) {
+      throw abortError();
+    }
+
+    record.subscribers += 1;
+    let abortReject: ((error: Error) => void) | undefined;
+    const onAbort = () => abortReject?.(abortError());
+    const abortPromise = signal
+      ? new Promise<never>((_resolve, reject) => {
+          abortReject = reject;
+          signal.addEventListener('abort', onAbort, { once: true });
+        })
+      : undefined;
+    try {
+      return abortPromise ? await Promise.race([record.promise, abortPromise]) : await record.promise;
+    } finally {
+      if (signal) {
+        signal.removeEventListener('abort', onAbort);
+      }
+      record.subscribers -= 1;
+      if (record.subscribers <= 0) {
+        this.releasePendingRecord(pendingKey, record);
+        record.controller.abort();
+      }
+    }
+  }
+
+  private releasePendingRecord(pendingKey: string, record: PendingDownload): void {
+    if (this.pendingDownloads.get(pendingKey) === record) {
+      this.pendingDownloads.delete(pendingKey);
+    }
+  }
+
+  private async downloadAndStore(
+    roomCode: string,
+    url: string,
+    cacheKey: string,
+    clipDurationMs: number,
+    signal: AbortSignal
+  ): Promise<string> {
     const clip = await downloadMp3Clip(this.fetcher, url, {
       targetMs: clipDurationMs,
-      maxBytes: this.maxBytes
+      maxBytes: this.maxBytes,
+      signal
     });
     if (clip.body.length === 0) {
       throw new Error('Audio file is empty');
@@ -214,6 +277,12 @@ export class AudioCache {
     ids.add(id);
     this.idsByRoom.set(roomCode, ids);
   }
+}
+
+function abortError(): Error {
+  const error = new Error('Audio download aborted');
+  error.name = 'AbortError';
+  return error;
 }
 
 function clampClipDuration(value: number | undefined): number {
