@@ -8,4 +8,5 @@ yandex-music-api-3.0.0/
 *.har
 .env
 .env.local
+.agent/
 *.log
