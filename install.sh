@@ -821,11 +821,10 @@ dir_is_empty() {
 }
 
 fetch_code() {
-  local placeholder="<REPO_URL>"
   run_root mkdir -p -- "$(dirname -- "$INSTALL_DIR")"
   if [[ -d "${INSTALL_DIR}/.git" ]]; then
     say "Обновляю существующую копию проекта в ${INSTALL_DIR}..."
-    if [[ -n "$REPO_URL" && "$REPO_URL" != *"$placeholder"* ]]; then
+    if [[ -n "$REPO_URL" ]]; then
       if ! git_in remote set-url origin "$REPO_URL" 2>/dev/null; then
         git_in remote add origin "$REPO_URL" 2>/dev/null || true
       fi
@@ -848,9 +847,6 @@ fetch_code() {
     fi
     say "Каталог ${INSTALL_DIR} уже существует: использую его без git clone."
   else
-    if [[ "$REPO_URL" == *"$placeholder"* ]]; then
-      die "Не задан URL репозитория. Запустите установщик с REPO_URL=https://github.com/<owner>/<repo>.git (ветка задаётся REPO_REF, по умолчанию ${REPO_REF})."
-    fi
     say "Клонирую ${REPO_URL} (ветка ${REPO_REF}) в ${INSTALL_DIR}..."
     if ! run_root git clone --branch "$REPO_REF" --depth 1 "$REPO_URL" "$INSTALL_DIR"; then
       die "Не удалось склонировать ${REPO_URL}. Проверьте REPO_URL, REPO_REF и доступ к репозиторию."
