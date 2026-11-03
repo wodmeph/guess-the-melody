@@ -105,12 +105,10 @@ The container runs the compiled Express server, which serves both the API and th
 `install.sh` performs a complete production deployment on Debian or Ubuntu: it installs Docker Compose v2 and Caddy after confirmation, clones the project, starts the Docker Compose container, and configures Caddy with automatic HTTPS. `git` and `curl` must be installed in advance.
 
 ```bash
-curl -fsSL <RAW_URL>/install.sh | REPO_URL=https://github.com/<owner>/<repo>.git bash
+curl -fsSL https://raw.githubusercontent.com/wodmeph/guess-the-melody/main/install.sh | bash
 ```
 
-`<RAW_URL>` is the raw base URL that serves repository files as plain text (for example `https://raw.githubusercontent.com/<owner>/<repo>/main`). `REPO_URL` must be set to the clone URL of the repository itself, not to a GitHub HTML page. All placeholders (`<RAW_URL>`, `<owner>`, `<repo>`) must be replaced before running the command.
-
-`REPO_URL` is required when the installation directory is missing or empty, because the installer clones the project into it; when the directory already contains a clone of the project, `REPO_URL` is optional. `REPO_REF` selects the branch or tag and defaults to `main`. The installer requires root privileges and asks for the `sudo` password once when needed.
+The installer clones `https://github.com/wodmeph/guess-the-melody.git` into `/opt/guess-the-melody` and checks out `REPO_REF`, which defaults to `main`. Set `REPO_URL` to clone a different repository and `REPO_REF` to install another branch or tag. The installer requires root privileges and asks for the `sudo` password once when needed.
 
 ### Supported Systems
 

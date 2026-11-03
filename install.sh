@@ -2,7 +2,7 @@
 # Установщик Guess the Melody: Docker Compose на Debian/Ubuntu с systemd.
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-<REPO_URL>}"
+REPO_URL="${REPO_URL:-https://github.com/wodmeph/guess-the-melody.git}"
 REPO_REF="${REPO_REF:-main}"
 INSTALL_DIR="${INSTALL_DIR:-}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}"
