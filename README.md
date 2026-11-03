@@ -100,6 +100,67 @@ Room data is kept in the `room-data` volume mounted at `/app/data`. `docker comp
 
 The container runs the compiled Express server, which serves both the API and the built frontend from `dist`.
 
+## One-Command Linux Install
+
+`install.sh` performs a complete production deployment on Debian or Ubuntu: it installs Docker Compose v2 and Caddy after confirmation, clones the project, starts the Docker Compose container, and configures Caddy with automatic HTTPS. `git` and `curl` must be installed in advance.
+
+```bash
+curl -fsSL <RAW_URL>/install.sh | REPO_URL=https://github.com/<owner>/<repo>.git bash
+```
+
+`<RAW_URL>` is the raw base URL that serves repository files as plain text (for example `https://raw.githubusercontent.com/<owner>/<repo>/main`). `REPO_URL` must be set to the clone URL of the repository itself, not to a GitHub HTML page. All placeholders (`<RAW_URL>`, `<owner>`, `<repo>`) must be replaced before running the command.
+
+`REPO_URL` is required when the installation directory is missing or empty, because the installer clones the project into it; when the directory already contains a clone of the project, `REPO_URL` is optional. `REPO_REF` selects the branch or tag and defaults to `main`. The installer requires root privileges and asks for the `sudo` password once when needed.
+
+### Supported Systems
+
+Debian and Ubuntu with `systemd` and `apt` are supported. On any other distribution the installer stops with an explanatory message.
+
+### Requirements and Automatic Installation
+
+The installer needs:
+
+- `git` and `curl` (must be installed in advance);
+- Docker with Compose v2 (`docker compose`);
+- Caddy.
+
+If Docker with Compose v2 or Caddy is missing, the installer offers to install it from the official repositories and asks for confirmation before making changes.
+
+### Interactive Prompts
+
+| Prompt | Environment variable | Default | Notes |
+| --- | --- | --- | --- |
+| Game domain | `DOMAIN` | — | Hostname without scheme, for example `melody.example.com`. Required. |
+| ACME e-mail | `ACME_EMAIL` | — | Let's Encrypt account e-mail. Required. |
+| Application port | `APP_HOST_PORT` | `3001` | Bound to `127.0.0.1`; the installer suggests a free port if the chosen one is busy. |
+| Yandex Music token | `YANDEX_MUSIC_TOKEN` | empty | Optional, hidden input. An empty answer keeps the token already stored in `.env` on re-runs. |
+| Audio delivery mode | `AUDIO_DELIVERY_MODE` | `direct` | `direct` or `cache`. |
+
+For non-interactive runs (for example in CI) the same values are read from the `DOMAIN`, `ACME_EMAIL`, `APP_HOST_PORT`, `YANDEX_MUSIC_TOKEN`, and `AUDIO_DELIVERY_MODE` environment variables. `DOMAIN` is always mandatory. `ACME_EMAIL` is mandatory unless it is set in the environment or already present in the existing `.env`; otherwise it is reused from there, as is `APP_HOST_PORT` (which falls back to `3001`). A busy `APP_HOST_PORT` aborts the installation with an error.
+
+### What the Installer Does
+
+1. Clones the repository into `INSTALL_DIR` (default `/opt/guess-the-melody`) and checks out `REPO_REF`. If `/opt/guess-the-melody` already belongs to an instance with another domain, the installer automatically chooses `/opt/guess-the-melody-<slug>` and a derived Compose project name; setting `INSTALL_DIR` or `COMPOSE_PROJECT_NAME` manually only overrides this choice.
+2. Generates `.env` with mode `600`, including `CLIENT_ORIGIN`, `APP_HOST_PORT`, `APP_DOMAIN`, `ACME_EMAIL`, `COMPOSE_PROJECT_NAME`, and the audio settings.
+3. Builds and starts the container with `docker compose up -d --build`.
+4. Waits for the container healthcheck and verifies `http://127.0.0.1:<port>/api/health`.
+
+### Caddy and HTTPS
+
+The installer writes a dedicated site file for the domain into `/etc/caddy/conf.d` (`<domain>.caddy`, with dots replaced by underscores, for example `melody_example_com.caddy`). The file proxies requests with `reverse_proxy 127.0.0.1:<port>` and sets the ACME e-mail for Let's Encrypt. It then adds the marker line `# guess-the-melody managed` and the line `import /etc/caddy/conf.d/*` to the main Caddyfile `/etc/caddy/Caddyfile` (a backup is made first; all backups are stored in `/var/backups/caddy-guess-the-melody`), runs `caddy validate`, and reloads the service with `systemctl reload caddy`. The HTTPS certificate is issued automatically.
+
+Other than the single marker line and the `import /etc/caddy/conf.d/*` line in the main Caddyfile, the installer does not change any configuration outside `/etc/caddy/conf.d`; unrelated sites on the host are left untouched.
+
+If the domain is already declared in the main Caddyfile or in another file in `/etc/caddy/conf.d`, the installer stops with a non-zero exit code before changing any Caddy configuration. By that point the `.env` file and the container are already prepared. Re-running with another domain or a separate `INSTALL_DIR` works without manual cleanup. This conflict check covers only the main Caddyfile and the `conf.d` directory.
+
+The domain's DNS record must point to the server, and ports 80 and 443 must be reachable from the outside. The Let's Encrypt certificate is not issued instantly and may take several minutes.
+
+### Re-running and Updating
+
+Running the installer again is idempotent: it updates the code with `git fetch`, preserves the existing `.env` while updating the keys related to the installer answers, keeps the `room-data` volume, and rewrites the Caddy block. To change the domain of an existing installation, set `ALLOW_DOMAIN_CHANGE=1`. To host several instances on one machine, use different `INSTALL_DIR` and `COMPOSE_PROJECT_NAME` values.
+
+Application variables such as audio cache tuning and room retention are described in [Environment Variables](#environment-variables).
+
 ## Production Without Docker
 
 Build the client and server:
