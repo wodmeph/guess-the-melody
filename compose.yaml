@@ -3,11 +3,12 @@ services:
     build:
       context: .
     ports:
-      - "3001:3001"
+      - "127.0.0.1:3001:3001"
     environment:
       NODE_ENV: production
       PORT: 3001
       HOST: 0.0.0.0
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN:-}
       ROOM_DB_PATH: /app/data/rooms.sqlite
       ROOM_TTL_HOURS: ${ROOM_TTL_HOURS:-72}
       YANDEX_MUSIC_TOKEN: ${YANDEX_MUSIC_TOKEN:-}
